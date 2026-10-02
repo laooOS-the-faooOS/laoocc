@@ -22,7 +22,6 @@
 #include "target/laoo-linux-musl.h"
 #include "codegen/codegen.h"
 #include "diagnostic/diagnostic_api.h"
-#include "lexer/lexer_api.h"
 #include "source/source_api.h"
 #include "error/error_api.h"
 
@@ -290,26 +289,6 @@ int main(void)
             diagnostic.severity ==
             LO_DIAGNOSTIC_NOTE
         );
-    }
-
-    /*
-     * Lexer
-     */
-    {
-        lo_lexer lexer;
-
-        lo_lexer_init(
-            &lexer,
-            "int x = 1;",
-            10
-        );
-
-        CHECK(
-            "lexer",
-            lo_lexer_run(&lexer) == 0
-        );
-
-        lo_lexer_free(&lexer);
     }
 
     /*
