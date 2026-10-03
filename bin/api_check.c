@@ -295,18 +295,24 @@ int main(void)
      * Source
      */
     {
-        lo_source source;
-
-        lo_source_init(&source);
+        lo_source source = {0};
+        const char *text = "int x;\n";
 
         CHECK(
             "source",
-            lo_source_set_data(
+            lo_source_init(
                 &source,
-                "int x;",
-                6
+                text,
+                7,
+                "test.c"
             ) == 0
         );
+
+        CHECK("source", source.data != NULL);
+        CHECK("source", source.length == 7);
+        CHECK("source", source.line_count == 2);
+        CHECK("source", lo_source_line(&source, 1) != NULL);
+        CHECK("source", lo_source_line_count(&source) == 2);
 
         lo_source_free(&source);
     }
