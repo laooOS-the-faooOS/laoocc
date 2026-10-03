@@ -1,3 +1,6 @@
 *.o
 laoocc
 laoocc-api-check
+
+# Build artifacts
+*.o
