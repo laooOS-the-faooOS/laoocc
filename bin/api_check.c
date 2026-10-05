@@ -16,7 +16,7 @@
 #include "symbol/symbol.h"
 #include "ast/ast.h"
 #include "ir/ir.h"
-#include "parser/parser_api.h"
+#include "parser_api.h"
 #include "sema/sema.h"
 #include "target/target.h"
 #include "target/laoo-linux-musl.h"

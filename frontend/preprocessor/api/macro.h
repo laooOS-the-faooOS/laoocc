@@ -1,14 +1,10 @@
-#ifndef LAOOCC_PREPROCESSOR_MACRO_H
-#define LAOOCC_PREPROCESSOR_MACRO_H
-
-#include <stddef.h>
+#ifndef LAOOCC_PP_MACRO_H
+#define LAOOCC_PP_MACRO_H
 
 typedef struct lo_pp_macro {
-    const char *name;
-    size_t name_length;
-
-    const char *replacement;
-    size_t replacement_length;
+    char *name;
+    char *value;
+    struct lo_pp_macro *next;
 } lo_pp_macro;
 
 #endif

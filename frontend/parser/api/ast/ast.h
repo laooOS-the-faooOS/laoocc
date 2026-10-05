@@ -7,4 +7,6 @@
 #include "ast/stmt.h"
 #include "ast/decl.h"
 
+void lo_ast_dump(const lo_ast_node *node, int indent);
+
 #endif /* LAOOCC_AST_AST_H */

@@ -7,7 +7,8 @@ CXXFLAGS = -std=c++17 -Wall -Wextra -Wpedantic -Ofast
 
 CPPFLAGS = -I./api \
            -I./frontend/lexer/api \
-           -I./frontend/preprocessor/api
+           -I./frontend/preprocessor/api \
+           -I./frontend/parser/api
 
 ARFLAGS  = rcs
 
@@ -16,7 +17,7 @@ OBJ = $(SRC:.c=.o)
 
 .PHONY: all check-build build-source objects laoocc clean
 
-all: check-build build-source laoocc
+all: check-build build-source laoocc lcc
 
 check-build:
 	@./scripts/check_build.sh
@@ -29,7 +30,11 @@ build-source: check-build
 
 objects: $(OBJ)
 
-laoocc: bin/main.o frontend/preprocessor/src/pp_engine.o
+laoocc: bin/main.o \
+        frontend/lexer/src/lexer.o \
+        frontend/preprocessor/src/pp_engine.o \
+        frontend/parser/src/parser.o \
+        frontend/parser/src/ast.o
 	@printf "\033[1m>>> linking executables ...\033[0m\n"
 	@printf "\033[1;34m  LD\033[0m    \033[1;37m%-45s\033[0m\n" "laoocc"
 	@$(CC) $(CFLAGS) $^ -o $@
@@ -40,6 +45,10 @@ laoocc: bin/main.o frontend/preprocessor/src/pp_engine.o
 	@mkdir -p $(dir $@)
 	@printf "\033[1;34m  CC\033[0m    \033[1;37m%-45s\033[0m \033[1;33m%s\033[0m\n" "$<" "$(CFLAGS)"
 	@$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+
+lcc: laoocc
+	@ln -sf laoocc lcc
+	@printf "\033[1;32m>>> lcc -> laoocc\033[0m\n"
 
 clean:
 	@find . -type f -name '*.o' -print | while read -r file; do \

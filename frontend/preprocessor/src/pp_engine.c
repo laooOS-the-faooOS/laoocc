@@ -1,948 +1,1882 @@
-/*
- * laoocc preprocessor v1 - alternative implementation file.
- *
- * Implements every function declared in preprocessor.h / directive.h:
- *   lo_preprocessor_init, lo_preprocessor_run, lo_preprocessor_free,
- *   lo_pp_error_name, lo_pp_directive_name
- * Build it INSTEAD of the stub preprocessor.c (not together with it).
- *
- * Supported: object-like #define, #undef, #ifdef, #ifndef, #if (integer
- * literal / defined), #else, #endif, #include "file", recursive macro
- * expansion with self-reference protection, comment- and string-aware
- * scanning, backslash-newline in directives.
- *
- * Ownership: each lo_pp_macro owns ONE heap block that holds
- * "name\0replacement\0"; macro->name is the block base pointer.
- */
+#include "preprocessor.h"
 
-#include <stdint.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include "preprocessor_api.h"
+#include <stdint.h>
 
 #define PP_MAX_EXPAND_DEPTH 64
 #define PP_MAX_INCLUDE_DEPTH 32
-#define PP_NOT_FOUND ((size_t)-1)
 
-/* Optional extra include directory (pointer must outlive the run). */
-static const char *g_include_dir = NULL;
+typedef struct pp_buffer {
+    char *data;
+    size_t length;
+    size_t capacity;
+} pp_buffer;
 
-void lo_pp_set_include_dir(const char *dir)
+typedef struct pp_conditional {
+    int parent_active;
+    int active;
+    int branch_taken;
+    struct pp_conditional *next;
+} pp_conditional;
+
+typedef struct pp_context {
+    lo_preprocessor *pp;
+    pp_buffer *output;
+    lo_pp_error *error;
+    unsigned include_depth;
+    pp_conditional *conditionals;
+} pp_context;
+
+/* ------------------------------------------------------------------ */
+/* buffer                                                              */
+/* ------------------------------------------------------------------ */
+
+static int buffer_reserve(pp_buffer *buffer, size_t extra)
 {
-    g_include_dir = dir;
+    size_t required;
+    size_t capacity;
+    char *data;
+
+    if (extra > SIZE_MAX - buffer->length - 1)
+        return -1;
+
+    required = buffer->length + extra + 1;
+
+    if (required <= buffer->capacity)
+        return 0;
+
+    capacity = buffer->capacity ? buffer->capacity : 256;
+
+    while (capacity < required) {
+        if (capacity > SIZE_MAX / 2)
+            return -1;
+
+        capacity *= 2;
+    }
+
+    data = realloc(buffer->data, capacity);
+    if (!data)
+        return -1;
+
+    buffer->data = data;
+    buffer->capacity = capacity;
+
+    return 0;
+}
+
+static int buffer_append(
+    pp_buffer *buffer,
+    const char *data,
+    size_t length)
+{
+    if (length == 0)
+        return 0;
+
+    if (buffer_reserve(buffer, length) != 0)
+        return -1;
+
+    memcpy(buffer->data + buffer->length, data, length);
+
+    buffer->length += length;
+    buffer->data[buffer->length] = '\0';
+
+    return 0;
+}
+
+static int buffer_putc(
+    pp_buffer *buffer,
+    char c)
+{
+    return buffer_append(buffer, &c, 1);
 }
 
 /* ------------------------------------------------------------------ */
-/* names                                                               */
+/* strings                                                             */
 /* ------------------------------------------------------------------ */
+
+static char *pp_strdup(const char *string)
+{
+    size_t length;
+    char *copy;
+
+    if (!string)
+        return NULL;
+
+    length = strlen(string);
+
+    copy = malloc(length + 1);
+    if (!copy)
+        return NULL;
+
+    memcpy(copy, string, length + 1);
+
+    return copy;
+}
+
+static char *pp_strndup(
+    const char *string,
+    size_t length)
+{
+    char *copy;
+
+    copy = malloc(length + 1);
+    if (!copy)
+        return NULL;
+
+    memcpy(copy, string, length);
+    copy[length] = '\0';
+
+    return copy;
+}
+
+/* ------------------------------------------------------------------ */
+/* characters                                                          */
+/* ------------------------------------------------------------------ */
+
+static int is_space_char(char c)
+{
+    return c == ' ' ||
+           c == '\t' ||
+           c == '\r' ||
+           c == '\v' ||
+           c == '\f';
+}
+
+static int is_identifier_start(char c)
+{
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           c == '_';
+}
+
+static int is_identifier_char(char c)
+{
+    return is_identifier_start(c) ||
+           (c >= '0' && c <= '9');
+}
+
+/* ------------------------------------------------------------------ */
+/* errors                                                              */
+/* ------------------------------------------------------------------ */
+
+static int pp_error(
+    pp_context *context,
+    lo_pp_error_kind kind,
+    const char *message,
+    size_t line,
+    size_t column)
+{
+    if (context->error) {
+        context->error->kind = kind;
+        context->error->message = message;
+        context->error->line = line;
+        context->error->column = column;
+    }
+
+    return -1;
+}
+
+static int pp_oom(pp_context *context, size_t line)
+{
+    return pp_error(
+        context,
+        LO_PP_ERROR_MEMORY,
+        "out of memory",
+        line,
+        1
+    );
+}
 
 const char *lo_pp_error_name(lo_pp_error_kind kind)
 {
     switch (kind) {
-    case LO_PP_ERROR_NONE:                    return "none";
-    case LO_PP_ERROR_INVALID_DIRECTIVE:       return "invalid directive";
-    case LO_PP_ERROR_INVALID_MACRO:           return "invalid macro";
-    case LO_PP_ERROR_UNDEFINED_MACRO:         return "undefined macro";
-    case LO_PP_ERROR_UNTERMINATED_CONDITIONAL:return "unterminated conditional";
-    case LO_PP_ERROR_UNEXPECTED_ELSE:         return "unexpected #else";
-    case LO_PP_ERROR_UNEXPECTED_ENDIF:        return "unexpected #endif";
-    case LO_PP_ERROR_INCLUDE_NOT_FOUND:       return "include not found";
-    }
-    return "unknown";
-}
+    case LO_PP_ERROR_NONE:
+        return "none";
 
-const char *lo_pp_directive_name(lo_pp_directive_kind kind)
-{
-    switch (kind) {
-    case LO_PP_DIRECTIVE_UNKNOWN: return "unknown";
-    case LO_PP_DIRECTIVE_DEFINE:  return "define";
-    case LO_PP_DIRECTIVE_UNDEF:   return "undef";
-    case LO_PP_DIRECTIVE_INCLUDE: return "include";
-    case LO_PP_DIRECTIVE_IF:      return "if";
-    case LO_PP_DIRECTIVE_IFDEF:   return "ifdef";
-    case LO_PP_DIRECTIVE_IFNDEF:  return "ifndef";
-    case LO_PP_DIRECTIVE_ELSE:    return "else";
-    case LO_PP_DIRECTIVE_ENDIF:   return "endif";
+    case LO_PP_ERROR_INVALID_DIRECTIVE:
+        return "invalid directive";
+
+    case LO_PP_ERROR_INVALID_DEFINE:
+        return "invalid define";
+
+    case LO_PP_ERROR_INVALID_UNDEF:
+        return "invalid undef";
+
+    case LO_PP_ERROR_INVALID_CONDITIONAL:
+        return "invalid conditional";
+
+    case LO_PP_ERROR_INCLUDE_NOT_FOUND:
+        return "include not found";
+
+    case LO_PP_ERROR_INCLUDE_ERROR:
+        return "include error";
+
+    case LO_PP_ERROR_MEMORY:
+        return "memory error";
     }
+
     return "unknown";
 }
 
 /* ------------------------------------------------------------------ */
-/* small growable byte buffer                                          */
+/* macros                                                              */
 /* ------------------------------------------------------------------ */
 
-typedef struct pp_buf {
-    char *data;
-    size_t length;
-    size_t capacity;
-} pp_buf;
-
-static int buf_reserve(pp_buf *b, size_t extra)
+static lo_pp_macro *find_macro(
+    lo_preprocessor *preprocessor,
+    const char *name)
 {
-    size_t need, cap;
-    char *p;
+    lo_pp_macro *macro;
 
-    if (extra > SIZE_MAX - b->length - 1) {
+    for (macro = preprocessor->macros;
+         macro;
+         macro = macro->next) {
+
+        if (strcmp(macro->name, name) == 0)
+            return macro;
+    }
+
+    return NULL;
+}
+
+static int define_macro(
+    lo_preprocessor *preprocessor,
+    const char *name,
+    const char *value)
+{
+    lo_pp_macro *macro;
+    char *new_value;
+
+    new_value = pp_strdup(value);
+
+    if (!new_value)
         return -1;
-    }
-    need = b->length + extra + 1;
-    if (need <= b->capacity) {
+
+    macro = find_macro(preprocessor, name);
+
+    if (macro) {
+        free(macro->value);
+        macro->value = new_value;
         return 0;
     }
-    cap = b->capacity ? b->capacity : 256;
-    while (cap < need) {
-        if (cap > SIZE_MAX / 2) {
-            return -1;
+
+    macro = calloc(1, sizeof(*macro));
+
+    if (!macro) {
+        free(new_value);
+        return -1;
+    }
+
+    macro->name = pp_strdup(name);
+
+    if (!macro->name) {
+        free(new_value);
+        free(macro);
+        return -1;
+    }
+
+    macro->value = new_value;
+
+    macro->next = preprocessor->macros;
+    preprocessor->macros = macro;
+
+    return 0;
+}
+
+static void undef_macro(
+    lo_preprocessor *preprocessor,
+    const char *name)
+{
+    lo_pp_macro **link;
+
+    link = &preprocessor->macros;
+
+    while (*link) {
+        lo_pp_macro *macro = *link;
+
+        if (strcmp(macro->name, name) == 0) {
+            *link = macro->next;
+
+            free(macro->name);
+            free(macro->value);
+            free(macro);
+
+            return;
         }
-        cap *= 2;
+
+        link = &macro->next;
     }
-    p = realloc(b->data, cap);
-    if (!p) {
+}
+
+/* ------------------------------------------------------------------ */
+/* conditionals                                                        */
+/* ------------------------------------------------------------------ */
+
+static int conditional_active(
+    pp_conditional *conditionals)
+{
+    if (!conditionals)
+        return 1;
+
+    return conditionals->active;
+}
+
+static int conditional_push(
+    pp_context *context,
+    int condition)
+{
+    pp_conditional *conditional;
+
+    conditional = calloc(1, sizeof(*conditional));
+
+    if (!conditional)
         return -1;
-    }
-    b->data = p;
-    b->capacity = cap;
+
+    conditional->parent_active =
+        conditional_active(context->conditionals);
+
+    conditional->active =
+        conditional->parent_active && condition;
+
+    conditional->branch_taken =
+        conditional->active;
+
+    conditional->next =
+        context->conditionals;
+
+    context->conditionals =
+        conditional;
+
     return 0;
 }
 
-static int buf_append(pp_buf *b, const char *s, size_t n)
+static int conditional_else(
+    pp_context *context)
 {
-    if (n == 0) {
-        return 0;
-    }
-    if (buf_reserve(b, n) != 0) {
+    pp_conditional *conditional;
+
+    conditional = context->conditionals;
+
+    if (!conditional)
         return -1;
+
+    if (conditional->branch_taken)
+        conditional->active = 0;
+    else {
+        conditional->active =
+            conditional->parent_active;
+
+        conditional->branch_taken =
+            conditional->active;
     }
-    memcpy(b->data + b->length, s, n);
-    b->length += n;
-    b->data[b->length] = '\0';
+
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* character classes (ASCII only, locale independent)                  */
-/* ------------------------------------------------------------------ */
-
-static int is_ws(char c)
+static int conditional_pop(
+    pp_context *context)
 {
-    return c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r';
+    pp_conditional *conditional;
+
+    conditional = context->conditionals;
+
+    if (!conditional)
+        return -1;
+
+    context->conditionals =
+        conditional->next;
+
+    free(conditional);
+
+    return 0;
 }
 
-static int is_digit(char c)
+static void conditional_free_all(
+    pp_context *context)
 {
-    return c >= '0' && c <= '9';
-}
-
-static int is_id_start(char c)
-{
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
-}
-
-static int is_id_char(char c)
-{
-    return is_id_start(c) || is_digit(c);
-}
-
-/* ------------------------------------------------------------------ */
-/* context + errors                                                    */
-/* ------------------------------------------------------------------ */
-
-typedef struct pp_ctx {
-    lo_preprocessor *pp;
-    pp_buf *out;
-    lo_pp_error *err;
-    int depth;
-} pp_ctx;
-
-static int pp_fail(pp_ctx *c, lo_pp_error_kind kind, const char *msg,
-                   size_t line, size_t col)
-{
-    if (c->err) {
-        c->err->kind = kind;
-        c->err->message = msg;
-        c->err->line = line;
-        c->err->column = col;
-    }
-    return -1;
-}
-
-/* The API has no out-of-memory error kind; INVALID_DIRECTIVE + message. */
-static int pp_oom(pp_ctx *c)
-{
-    return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE, "out of memory",
-                   c->pp->line, 1);
+    while (context->conditionals)
+        conditional_pop(context);
 }
 
 /* ------------------------------------------------------------------ */
-/* macro table (linear)                                                */
+/* macro expansion                                                     */
 /* ------------------------------------------------------------------ */
 
-static size_t macro_find(const lo_preprocessor *pp, const char *name, size_t n)
+static int macro_disabled(
+    lo_pp_macro **disabled,
+    size_t count,
+    lo_pp_macro *macro)
 {
     size_t i;
 
-    for (i = 0; i < pp->macro_count; i++) {
-        const lo_pp_macro *m = &pp->macros[i];
-        if (m->name_length == n && memcmp(m->name, name, n) == 0) {
-            return i;
-        }
+    for (i = 0; i < count; ++i) {
+        if (disabled[i] == macro)
+            return 1;
     }
-    return PP_NOT_FOUND;
-}
 
-static int macro_set(lo_preprocessor *pp, const char *name, size_t nl,
-                     const char *repl, size_t rl)
-{
-    size_t idx;
-    char *block;
-    lo_pp_macro *m;
-
-    if (nl > SIZE_MAX - rl - 2) {
-        return -1;
-    }
-    block = malloc(nl + rl + 2);
-    if (!block) {
-        return -1;
-    }
-    memcpy(block, name, nl);
-    block[nl] = '\0';
-    memcpy(block + nl + 1, repl, rl);
-    block[nl + 1 + rl] = '\0';
-
-    idx = macro_find(pp, name, nl);
-    if (idx == PP_NOT_FOUND) {
-        if (pp->macro_count == pp->macro_capacity) {
-            size_t cap = pp->macro_capacity ? pp->macro_capacity * 2 : 16;
-            lo_pp_macro *grown = realloc(pp->macros, cap * sizeof *grown);
-            if (!grown) {
-                free(block);
-                return -1;
-            }
-            pp->macros = grown;
-            pp->macro_capacity = cap;
-        }
-        idx = pp->macro_count++;
-    } else {
-        free((void *)pp->macros[idx].name);
-    }
-    m = &pp->macros[idx];
-    m->name = block;
-    m->name_length = nl;
-    m->replacement = block + nl + 1;
-    m->replacement_length = rl;
     return 0;
 }
 
-static void macro_remove(lo_preprocessor *pp, size_t idx)
-{
-    free((void *)pp->macros[idx].name);
-    memmove(&pp->macros[idx], &pp->macros[idx + 1],
-            (pp->macro_count - idx - 1) * sizeof pp->macros[0]);
-    pp->macro_count--;
-}
-
-/* ------------------------------------------------------------------ */
-/* conditional stack                                                   */
-/* ------------------------------------------------------------------ */
-
-static int is_active(const lo_preprocessor *pp)
-{
-    return pp->conditional_count == 0
-        || pp->conditionals[pp->conditional_count - 1].active;
-}
-
-static int cond_push(lo_preprocessor *pp, int parent_active, int cond)
-{
-    lo_pp_conditional *cd;
-
-    if (pp->conditional_count == pp->conditional_capacity) {
-        size_t cap = pp->conditional_capacity ? pp->conditional_capacity * 2 : 8;
-        lo_pp_conditional *grown = realloc(pp->conditionals, cap * sizeof *grown);
-        if (!grown) {
-            return -1;
-        }
-        pp->conditionals = grown;
-        pp->conditional_capacity = cap;
-    }
-    cd = &pp->conditionals[pp->conditional_count++];
-    cd->parent_active = parent_active;
-    cd->active = parent_active && cond;
-    cd->else_seen = 0;
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* macro expansion of ordinary source text                             */
-/* ------------------------------------------------------------------ */
-
-static int expand_text(pp_ctx *c, const char *s, size_t n, int *in_block,
-                       size_t *hide, size_t hide_count)
+static int expand_text(
+    pp_context *context,
+    const char *source,
+    size_t length,
+    lo_pp_macro **disabled,
+    size_t disabled_count)
 {
     size_t i = 0;
 
-    while (i < n) {
-        char ch = s[i];
-        size_t st;
+    while (i < length) {
+        char c = source[i];
 
-        if (*in_block) {
-            st = i;
-            while (i < n && !(s[i] == '*' && i + 1 < n && s[i + 1] == '/')) {
-                i++;
-            }
-            if (i < n) {
-                i += 2;
-                *in_block = 0;
-            }
-            if (buf_append(c->out, s + st, i - st)) return pp_oom(c);
-            continue;
-        }
+        /*
+         * Strings and character constants are copied verbatim.
+         */
+        if (c == '"' || c == '\'') {
+            char quote = c;
+            size_t start = i;
 
-        if (ch == '/' && i + 1 < n && s[i + 1] == '/') {
-            if (buf_append(c->out, s + i, n - i)) return pp_oom(c);
-            return 0;
-        }
-        if (ch == '/' && i + 1 < n && s[i + 1] == '*') {
-            *in_block = 1;
-            if (buf_append(c->out, "/*", 2)) return pp_oom(c);
-            i += 2;
-            continue;
-        }
-        if (ch == '"' || ch == '\'') {
-            st = i++;
-            while (i < n && s[i] != ch) {
-                if (s[i] == '\\' && i + 1 < n) i++;
-                i++;
-            }
-            if (i < n) i++;
-            if (buf_append(c->out, s + st, i - st)) return pp_oom(c);
-            continue;
-        }
-        if (is_digit(ch)) { /* pp-number: never expand inside */
-            st = i++;
-            while (i < n) {
-                char p = s[i];
-                if (is_id_char(p) || p == '.') {
-                    i++;
-                } else if ((p == '+' || p == '-')
-                           && (s[i - 1] == 'e' || s[i - 1] == 'E'
-                               || s[i - 1] == 'p' || s[i - 1] == 'P')) {
-                    i++;
-                } else {
+            ++i;
+
+            while (i < length) {
+                if (source[i] == '\\') {
+                    if (i + 1 < length)
+                        i += 2;
+                    else
+                        ++i;
+
+                    continue;
+                }
+
+                if (source[i] == quote) {
+                    ++i;
                     break;
                 }
+
+                ++i;
             }
-            if (buf_append(c->out, s + st, i - st)) return pp_oom(c);
+
+            if (buffer_append(
+                    context->output,
+                    source + start,
+                    i - start) != 0)
+                return pp_oom(context, 0);
+
             continue;
         }
-        if (is_id_start(ch)) {
-            size_t idx, k;
-            int hidden = 0;
 
-            st = i;
-            while (i < n && is_id_char(s[i])) i++;
-            idx = macro_find(c->pp, s + st, i - st);
-            if (idx != PP_NOT_FOUND) {
-                for (k = 0; k < hide_count; k++) {
-                    if (hide[k] == idx) { hidden = 1; break; }
-                }
-            }
-            if (idx != PP_NOT_FOUND && !hidden && hide_count < PP_MAX_EXPAND_DEPTH) {
-                const lo_pp_macro *m = &c->pp->macros[idx];
-                int local_block = 0;
-                hide[hide_count] = idx;
-                if (expand_text(c, m->replacement, m->replacement_length,
-                                &local_block, hide, hide_count + 1)) {
+        /*
+         * Comments are copied verbatim.
+         */
+        if (c == '/' &&
+            i + 1 < length &&
+            source[i + 1] == '/') {
+
+            if (buffer_append(
+                    context->output,
+                    source + i,
+                    length - i) != 0)
+                return pp_oom(context, 0);
+
+            return 0;
+        }
+
+        if (c == '/' &&
+            i + 1 < length &&
+            source[i + 1] == '*') {
+
+            size_t start = i;
+
+            i += 2;
+
+            while (i + 1 < length &&
+                   !(source[i] == '*' &&
+                     source[i + 1] == '/'))
+                ++i;
+
+            if (i + 1 < length)
+                i += 2;
+            else
+                i = length;
+
+            if (buffer_append(
+                    context->output,
+                    source + start,
+                    i - start) != 0)
+                return pp_oom(context, 0);
+
+            continue;
+        }
+
+        /*
+         * Identifier -> macro expansion.
+         */
+        if (is_identifier_start(c)) {
+            size_t start = i;
+            size_t name_length;
+            char *name;
+            lo_pp_macro *macro;
+
+            ++i;
+
+            while (i < length &&
+                   is_identifier_char(source[i]))
+                ++i;
+
+            name_length = i - start;
+
+            name = pp_strndup(
+                source + start,
+                name_length);
+
+            if (!name)
+                return pp_oom(context, 0);
+
+            macro = find_macro(
+                context->pp,
+                name);
+
+            if (macro &&
+                !macro_disabled(
+                    disabled,
+                    disabled_count,
+                    macro) &&
+                disabled_count < PP_MAX_EXPAND_DEPTH) {
+
+                lo_pp_macro *next_disabled[
+                    PP_MAX_EXPAND_DEPTH
+                ];
+
+                memcpy(
+                    next_disabled,
+                    disabled,
+                    disabled_count *
+                    sizeof(*disabled));
+
+                next_disabled[disabled_count] =
+                    macro;
+
+                if (expand_text(
+                        context,
+                        macro->value,
+                        strlen(macro->value),
+                        next_disabled,
+                        disabled_count + 1) != 0) {
+
+                    free(name);
                     return -1;
                 }
-            } else if (buf_append(c->out, s + st, i - st)) {
-                return pp_oom(c);
+            } else {
+                if (buffer_append(
+                        context->output,
+                        source + start,
+                        name_length) != 0) {
+
+                    free(name);
+                    return pp_oom(context, 0);
+                }
             }
+
+            free(name);
+
             continue;
         }
 
-        /* run of plain characters */
-        st = i;
-        while (i < n) {
-            char p = s[i];
-            if (is_id_char(p) || p == '"' || p == '\'' || p == '/') break;
-            i++;
-        }
-        if (i == st) i++; /* lone '/' */
-        if (buf_append(c->out, s + st, i - st)) return pp_oom(c);
+        /*
+         * Normal character.
+         */
+        if (buffer_putc(
+                context->output,
+                c) != 0)
+            return pp_oom(context, 0);
+
+        ++i;
     }
+
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* directive text cleaning: strip comments + line continuations        */
-/* dst may be NULL (state tracking only). Returns cleaned length.      */
+/* file handling                                                       */
 /* ------------------------------------------------------------------ */
 
-static size_t clean_text(const char *s, size_t n, char *dst, int *in_block)
+static char *read_file(
+    const char *path,
+    size_t *length)
 {
-    size_t i = 0, o = 0;
+    FILE *file;
+    long size;
+    size_t read_count;
+    char *buffer;
 
-    while (i < n) {
-        char ch = s[i];
+    file = fopen(path, "rb");
 
-        if (*in_block) {
-            if (ch == '*' && i + 1 < n && s[i + 1] == '/') {
-                *in_block = 0;
-                i += 2;
-                if (dst) dst[o] = ' ';
-                o++;
-            } else {
-                i++;
-            }
-            continue;
-        }
-        if (ch == '\\') {
-            size_t j = i + 1;
-            if (j < n && s[j] == '\r') j++;
-            if (j < n && s[j] == '\n') {
-                i = j + 1;
-                continue;
-            }
-        }
-        if (ch == '/' && i + 1 < n && s[i + 1] == '/') {
-            break;
-        }
-        if (ch == '/' && i + 1 < n && s[i + 1] == '*') {
-            *in_block = 1;
-            i += 2;
-            continue;
-        }
-        if (ch == '"' || ch == '\'') {
-            if (dst) dst[o] = ch;
-            o++;
-            i++;
-            while (i < n && s[i] != ch) {
-                if (s[i] == '\\' && i + 1 < n) {
-                    if (dst) dst[o] = s[i];
-                    o++;
-                    i++;
-                }
-                if (dst) dst[o] = s[i];
-                o++;
-                i++;
-            }
-            if (i < n) {
-                if (dst) dst[o] = s[i];
-                o++;
-                i++;
-            }
-            continue;
-        }
-        if (dst) dst[o] = ch;
-        o++;
-        i++;
+    if (!file)
+        return NULL;
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
     }
-    return o;
+
+    size = ftell(file);
+
+    if (size < 0) {
+        fclose(file);
+        return NULL;
+    }
+
+    if (fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
+
+    buffer = malloc((size_t)size + 1);
+
+    if (!buffer) {
+        fclose(file);
+        return NULL;
+    }
+
+    read_count =
+        fread(buffer, 1, (size_t)size, file);
+
+    fclose(file);
+
+    if (read_count != (size_t)size) {
+        free(buffer);
+        return NULL;
+    }
+
+    buffer[read_count] = '\0';
+
+    if (length)
+        *length = read_count;
+
+    return buffer;
 }
 
-/* ------------------------------------------------------------------ */
-/* directive helpers                                                   */
-/* ------------------------------------------------------------------ */
-
-static void skip_ws(const char *t, size_t n, size_t *p)
+static int file_exists(const char *path)
 {
-    while (*p < n && is_ws(t[*p])) (*p)++;
-}
+    FILE *file;
 
-static int parse_ident(const char *t, size_t n, size_t *p, size_t *start,
-                       size_t *len)
-{
-    skip_ws(t, n, p);
-    if (*p >= n || !is_id_start(t[*p])) return 0;
-    *start = *p;
-    while (*p < n && is_id_char(t[*p])) (*p)++;
-    *len = *p - *start;
+    file = fopen(path, "rb");
+
+    if (!file)
+        return 0;
+
+    fclose(file);
+
     return 1;
 }
 
-static lo_pp_directive_kind classify(const char *s, size_t n)
+static char *join_path(
+    const char *directory,
+    const char *name)
 {
-    struct { const char *name; size_t len; lo_pp_directive_kind kind; } tbl[] = {
-        { "define", 6, LO_PP_DIRECTIVE_DEFINE },
-        { "undef",  5, LO_PP_DIRECTIVE_UNDEF },
-        { "include",7, LO_PP_DIRECTIVE_INCLUDE },
-        { "ifdef",  5, LO_PP_DIRECTIVE_IFDEF },
-        { "ifndef", 6, LO_PP_DIRECTIVE_IFNDEF },
-        { "if",     2, LO_PP_DIRECTIVE_IF },
-        { "else",   4, LO_PP_DIRECTIVE_ELSE },
-        { "endif",  5, LO_PP_DIRECTIVE_ENDIF }
-    };
-    size_t i;
+    size_t directory_length;
+    size_t name_length;
+    int separator;
+    char *path;
 
-    for (i = 0; i < sizeof tbl / sizeof tbl[0]; i++) {
-        if (tbl[i].len == n && memcmp(tbl[i].name, s, n) == 0) {
-            return tbl[i].kind;
-        }
-    }
-    return LO_PP_DIRECTIVE_UNKNOWN;
+    directory_length =
+        strlen(directory);
+
+    name_length =
+        strlen(name);
+
+    separator =
+        directory_length > 0 &&
+        directory[directory_length - 1] != '/';
+
+    path = malloc(
+        directory_length +
+        (size_t)separator +
+        name_length +
+        1);
+
+    if (!path)
+        return NULL;
+
+    memcpy(
+        path,
+        directory,
+        directory_length);
+
+    if (separator)
+        path[directory_length++] = '/';
+
+    memcpy(
+        path + directory_length,
+        name,
+        name_length);
+
+    path[
+        directory_length +
+        name_length
+    ] = '\0';
+
+    return path;
 }
 
-/* #if: integer literal, "defined X", "defined(X)", optional leading '!' */
-static int eval_if(pp_ctx *c, const char *t, size_t n, size_t p,
-                   int *result, size_t line, size_t col)
+static char *source_directory(
+    const char *source_file)
 {
-    int negate = 0;
-    const char *bad = "unsupported #if expression";
+    const char *slash;
+    size_t length;
 
-    skip_ws(t, n, &p);
-    while (p < n && t[p] == '!') {
-        negate = !negate;
-        p++;
-        skip_ws(t, n, &p);
-    }
-    if (p < n && is_digit(t[p])) {
-        char *end;
-        long v = strtol(t + p, &end, 0); /* t is NUL terminated */
-        p = (size_t)(end - t);
-        skip_ws(t, n, &p);
-        if (p != n) return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE, bad, line, col);
-        *result = (v != 0) != negate;
-        return 0;
-    }
-    if (n - p >= 7 && memcmp(t + p, "defined", 7) == 0 && !is_id_char(t[p + 7])) {
-        size_t s, l, q = p + 7;
-        int paren = 0;
-        skip_ws(t, n, &q);
-        if (q < n && t[q] == '(') { paren = 1; q++; }
-        if (!parse_ident(t, n, &q, &s, &l)) {
-            return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE, bad, line, col);
-        }
-        skip_ws(t, n, &q);
-        if (paren) {
-            if (q >= n || t[q] != ')') {
-                return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE, bad, line, col);
-            }
-            q++;
-            skip_ws(t, n, &q);
-        }
-        if (q != n) return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE, bad, line, col);
-        *result = (macro_find(c->pp, t + s, l) != PP_NOT_FOUND) != negate;
-        return 0;
-    }
-    return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE, bad, line, col);
+    if (!source_file)
+        return pp_strdup(".");
+
+    slash = strrchr(source_file, '/');
+
+    if (!slash)
+        return pp_strdup(".");
+
+    if (slash == source_file)
+        return pp_strdup("/");
+
+    length =
+        (size_t)(slash - source_file);
+
+    return pp_strndup(
+        source_file,
+        length);
 }
 
 /* ------------------------------------------------------------------ */
-/* include                                                             */
+/* include search                                                      */
 /* ------------------------------------------------------------------ */
 
-static int read_file(const char *path, pp_buf *dst)
+static char *find_include(
+    lo_preprocessor *preprocessor,
+    const char *name,
+    int angled)
 {
-    FILE *f = fopen(path, "rb");
-    char chunk[4096];
-    size_t got;
+    lo_pp_include_dir *directory;
+    char *path;
+    char *source_dir;
 
-    if (!f) return -1;
-    while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) {
-        if (buf_append(dst, chunk, got)) { fclose(f); return -2; }
-    }
-    if (ferror(f)) { fclose(f); return -1; }
-    fclose(f);
-    if (!dst->data && buf_reserve(dst, 0) == 0) dst->data[0] = '\0';
-    return 0;
-}
+    /*
+     * #include "file.h"
+     *
+     * Search the directory containing
+     * the current source file first.
+     */
+    if (!angled &&
+        preprocessor->source_file) {
 
-static int process(pp_ctx *c, const char *src, size_t len, const char *dir);
+        source_dir =
+            source_directory(
+                preprocessor->source_file);
 
-static int do_include(pp_ctx *c, const char *t, size_t n, size_t p,
-                      size_t line, size_t col, const char *dir)
-{
-    char close;
-    size_t ns, nl, i;
-    const char *roots[3];
-    pp_buf file = { NULL, 0, 0 };
-    char *path = NULL, *newdir = NULL;
-    int rc;
+        if (!source_dir)
+            return NULL;
 
-    skip_ws(t, n, &p);
-    if (p >= n || (t[p] != '"' && t[p] != '<')) {
-        return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE,
-                       "expected \"file\" after #include", line, col);
-    }
-    close = t[p] == '"' ? '"' : '>';
-    ns = ++p;
-    while (p < n && t[p] != close) p++;
-    if (p >= n || p == ns) {
-        return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE,
-                       "malformed #include", line, col);
-    }
-    nl = p - ns;
+        path =
+            join_path(
+                source_dir,
+                name);
 
-    if (c->depth >= PP_MAX_INCLUDE_DEPTH) {
-        return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE,
-                       "#include nested too deeply", line, col);
-    }
+        free(source_dir);
 
-    roots[0] = dir;
-    roots[1] = g_include_dir;
-    roots[2] = NULL;
-    for (i = 0; i < 3; i++) {
-        size_t rl = roots[i] ? strlen(roots[i]) : 0;
-        int r;
+        if (!path)
+            return NULL;
 
-        if (i < 2 && rl == 0) continue;
-        path = malloc(rl + 1 + nl + 1);
-        if (!path) return pp_oom(c);
-        if (rl) {
-            memcpy(path, roots[i], rl);
-            path[rl] = '/';
-            memcpy(path + rl + 1, t + ns, nl);
-            path[rl + 1 + nl] = '\0';
-        } else {
-            memcpy(path, t + ns, nl);
-            path[nl] = '\0';
-        }
-        r = read_file(path, &file);
-        if (r == -2) { free(path); free(file.data); return pp_oom(c); }
-        if (r == 0) break;
-        free(file.data);
-        file.data = NULL; file.length = file.capacity = 0;
+        if (file_exists(path))
+            return path;
+
         free(path);
-        path = NULL;
-    }
-    if (!path) {
-        return pp_fail(c, LO_PP_ERROR_INCLUDE_NOT_FOUND,
-                       "include file not found", line, col);
     }
 
+    /*
+     * -I directories.
+     */
+    for (directory =
+             preprocessor->include_dirs;
+         directory;
+         directory =
+             directory->next) {
+
+        path =
+            join_path(
+                directory->path,
+                name);
+
+        if (!path)
+            return NULL;
+
+        if (file_exists(path))
+            return path;
+
+        free(path);
+    }
+
+    /*
+     * Host system headers.
+     *
+     * We'll eventually make these
+     * configurable through sysroot.
+     */
     {
-        const char *slash = strrchr(path, '/');
-        size_t dl = slash ? (size_t)(slash - path) : 0;
-        if (slash) {
-            newdir = malloc(dl + 1);
-            if (!newdir) { free(path); free(file.data); return pp_oom(c); }
-            memcpy(newdir, path, dl);
-            newdir[dl] = '\0';
+        static const char *system_dirs[] = {
+            "/usr/local/include",
+            "/usr/include",
+            NULL
+        };
+
+        size_t i;
+
+        for (i = 0;
+             system_dirs[i];
+             ++i) {
+
+            path =
+                join_path(
+                    system_dirs[i],
+                    name);
+
+            if (!path)
+                return NULL;
+
+            if (file_exists(path))
+                return path;
+
+            free(path);
         }
     }
-    free(path);
 
-    c->depth++;
-    rc = process(c, file.data ? file.data : "", file.length, newdir);
-    c->depth--;
-    free(newdir);
-    free(file.data);
-    if (rc) return rc;
+    return NULL;
+}
 
-    if (c->out->length > 0 && c->out->data[c->out->length - 1] != '\n') {
-        if (buf_append(c->out, "\n", 1)) return pp_oom(c);
+/* ------------------------------------------------------------------ */
+/* include processing                                                  */
+/* ------------------------------------------------------------------ */
+
+static int process_source(
+    pp_context *context,
+    const char *source,
+    size_t length,
+    const char *source_file,
+    unsigned depth);
+
+static int process_include(
+    pp_context *context,
+    const char *name,
+    int angled,
+    size_t line)
+{
+    char *include_path;
+    char *included_source;
+    char *old_source_file;
+    size_t included_length;
+    int result;
+
+    if (context->include_depth >=
+        PP_MAX_INCLUDE_DEPTH) {
+
+        return pp_error(
+            context,
+            LO_PP_ERROR_INCLUDE_ERROR,
+            "include nesting too deep",
+            line,
+            1);
     }
+
+    include_path =
+        find_include(
+            context->pp,
+            name,
+            angled);
+
+    if (!include_path) {
+        return pp_error(
+            context,
+            LO_PP_ERROR_INCLUDE_NOT_FOUND,
+            "include file not found",
+            line,
+            1);
+    }
+
+    included_source =
+        read_file(
+            include_path,
+            &included_length);
+
+    if (!included_source) {
+        free(include_path);
+
+        return pp_error(
+            context,
+            LO_PP_ERROR_INCLUDE_ERROR,
+            "failed to read include file",
+            line,
+            1);
+    }
+
+    old_source_file =
+        context->pp->source_file;
+
+    context->pp->source_file =
+        include_path;
+
+    ++context->include_depth;
+
+    result =
+        process_source(
+            context,
+            included_source,
+            included_length,
+            include_path,
+            context->include_depth);
+
+    --context->include_depth;
+
+    context->pp->source_file =
+        old_source_file;
+
+    free(included_source);
+    free(include_path);
+
+    return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* directive parsing                                                   */
+/* ------------------------------------------------------------------ */
+
+static void skip_spaces(
+    const char **cursor,
+    const char *end)
+{
+    while (*cursor < end &&
+           is_space_char(**cursor))
+        ++*cursor;
+}
+
+static int parse_identifier(
+    const char **cursor,
+    const char *end,
+    char *name,
+    size_t name_size)
+{
+    size_t length = 0;
+
+    skip_spaces(cursor, end);
+
+    if (*cursor >= end ||
+        !is_identifier_start(**cursor))
+        return -1;
+
+    while (*cursor < end &&
+           is_identifier_char(**cursor)) {
+
+        if (length + 1 < name_size)
+            name[length++] = **cursor;
+
+        ++*cursor;
+    }
+
+    name[length] = '\0';
+
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* directive dispatch                                                  */
-/* ------------------------------------------------------------------ */
-
-static int run_directive(pp_ctx *c, const char *t, size_t n, size_t line,
-                         size_t col, const char *dir)
+static int evaluate_condition(
+    lo_preprocessor *preprocessor,
+    const char *expression,
+    size_t length)
 {
-    lo_preprocessor *pp = c->pp;
-    size_t p = 0, ks, kl, ns, nl;
-    int active = is_active(pp);
-    lo_pp_directive_kind kind;
+    const char *cursor = expression;
+    char *end;
+    long value;
+    char *expanded;
+    size_t expanded_length;
+    pp_buffer buffer = {0};
+    lo_pp_macro *macro;
+    char name[256];
 
-    skip_ws(t, n, &p);
-    ks = p;
-    while (p < n && is_id_char(t[p])) p++;
-    kl = p - ks;
-    if (kl == 0) {
-        skip_ws(t, n, &p);
-        if (p >= n || !active) return 0; /* null directive */
-        return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE,
-                       "invalid preprocessing directive", line, col);
-    }
-    kind = classify(t + ks, kl);
+    skip_spaces(
+        &cursor,
+        expression + length);
 
-    switch (kind) {
-    case LO_PP_DIRECTIVE_IFDEF:
-    case LO_PP_DIRECTIVE_IFNDEF: {
-        int cond = 0;
-        if (active) {
-            if (!parse_ident(t, n, &p, &ns, &nl)) {
-                return pp_fail(c, LO_PP_ERROR_INVALID_MACRO,
-                               "expected macro name", line, col);
+    /*
+     * defined(NAME)
+     */
+    if (strncmp(cursor, "defined", 7) == 0) {
+        cursor += 7;
+
+        while (cursor < expression + length &&
+               is_space_char(*cursor))
+            ++cursor;
+
+        if (cursor < expression + length &&
+            *cursor == '(') {
+
+            ++cursor;
+
+            if (parse_identifier(
+                    &cursor,
+                    expression + length,
+                    name,
+                    sizeof(name)) != 0)
+                return 0;
+
+            while (cursor < expression + length &&
+                   is_space_char(*cursor))
+                ++cursor;
+
+            if (cursor < expression + length &&
+                *cursor == ')') {
+
+                macro =
+                    find_macro(
+                        preprocessor,
+                        name);
+
+                return macro != NULL;
             }
-            cond = macro_find(pp, t + ns, nl) != PP_NOT_FOUND;
-            if (kind == LO_PP_DIRECTIVE_IFNDEF) cond = !cond;
+
+            return 0;
         }
-        if (cond_push(pp, active, cond)) return pp_oom(c);
-        return 0;
+
+        if (parse_identifier(
+                &cursor,
+                expression + length,
+                name,
+                sizeof(name)) != 0)
+            return 0;
+
+        macro =
+            find_macro(
+                preprocessor,
+                name);
+
+        return macro != NULL;
     }
-    case LO_PP_DIRECTIVE_IF: {
-        int cond = 0;
-        if (active && eval_if(c, t, n, p, &cond, line, col)) return -1;
-        if (cond_push(pp, active, cond)) return pp_oom(c);
-        return 0;
-    }
-    case LO_PP_DIRECTIVE_ELSE: {
-        lo_pp_conditional *cd;
-        /* underflow vs. the current file's base is checked in process() */
-        cd = &pp->conditionals[pp->conditional_count - 1];
-        if (cd->else_seen) {
-            return pp_fail(c, LO_PP_ERROR_UNEXPECTED_ELSE,
-                           "duplicate #else", line, col);
+
+    /*
+     * Expand simple macros before
+     * evaluating integer constants.
+     */
+    {
+        pp_context context;
+
+        memset(&context, 0, sizeof(context));
+
+        context.pp =
+            preprocessor;
+
+        context.output =
+            &buffer;
+
+        if (expand_text(
+                &context,
+                expression,
+                length,
+                NULL,
+                0) != 0) {
+
+            free(buffer.data);
+            return 0;
         }
-        cd->else_seen = 1;
-        cd->active = cd->parent_active && !cd->active;
+    }
+
+    expanded =
+        buffer.data;
+
+    expanded_length =
+        buffer.length;
+
+    (void)expanded_length;
+
+    if (!expanded)
+        return 0;
+
+    value =
+        strtol(
+            expanded,
+            &end,
+            0);
+
+    while (*end &&
+           isspace((unsigned char)*end))
+        ++end;
+
+    if (*end != '\0') {
+        free(expanded);
         return 0;
     }
-    case LO_PP_DIRECTIVE_ENDIF:
-        pp->conditional_count--;
-        return 0;
-    case LO_PP_DIRECTIVE_DEFINE: {
-        size_t re;
-        if (!active) return 0;
-        if (!parse_ident(t, n, &p, &ns, &nl)) {
-            return pp_fail(c, LO_PP_ERROR_INVALID_MACRO,
-                           "expected macro name after #define", line, col);
-        }
-        if (p < n && t[p] == '(') {
-            return pp_fail(c, LO_PP_ERROR_INVALID_MACRO,
-                           "function-like macros are not supported", line, col);
-        }
-        skip_ws(t, n, &p);
-        re = n;
-        while (re > p && is_ws(t[re - 1])) re--;
-        if (macro_set(pp, t + ns, nl, t + p, re - p)) return pp_oom(c);
-        return 0;
-    }
-    case LO_PP_DIRECTIVE_UNDEF: {
-        size_t idx;
-        if (!active) return 0;
-        if (!parse_ident(t, n, &p, &ns, &nl)) {
-            return pp_fail(c, LO_PP_ERROR_INVALID_MACRO,
-                           "expected macro name after #undef", line, col);
-        }
-        idx = macro_find(pp, t + ns, nl);
-        if (idx != PP_NOT_FOUND) macro_remove(pp, idx);
-        return 0;
-    }
-    case LO_PP_DIRECTIVE_INCLUDE:
-        if (!active) return 0;
-        return do_include(c, t, n, p, line, col, dir);
-    case LO_PP_DIRECTIVE_UNKNOWN:
-    default:
-        if (!active) return 0;
-        return pp_fail(c, LO_PP_ERROR_INVALID_DIRECTIVE,
-                       "unknown preprocessing directive", line, col);
-    }
+
+    free(expanded);
+
+    return value != 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* line-by-line driver                                                 */
+/* line processing                                                     */
 /* ------------------------------------------------------------------ */
 
-/* End of the logical line starting at pos (index of '\n' or len). */
-static size_t logical_line_end(const char *s, size_t len, size_t pos,
-                               size_t *lines)
+static int process_source(
+    pp_context *context,
+    const char *source,
+    size_t length,
+    const char *source_file,
+    unsigned depth)
 {
-    size_t i = pos;
+    size_t offset = 0;
+    size_t line = 1;
+    pp_conditional *saved_conditionals;
 
-    *lines = 1;
-    while (i < len) {
-        if (s[i] == '\n') {
-            size_t b = i;
-            if (b > pos && s[b - 1] == '\r') b--;
-            if (b > pos && s[b - 1] == '\\') {
-                (*lines)++;
-                i++;
-                continue;
-            }
-            return i;
+    (void)source_file;
+    (void)depth;
+
+    saved_conditionals =
+        context->conditionals;
+
+    while (offset < length) {
+        size_t line_start = offset;
+        size_t line_end;
+        size_t cursor;
+        size_t logical_end;
+        int directive = 0;
+
+        /*
+         * Find physical line ending.
+         */
+        while (offset < length &&
+               source[offset] != '\n')
+            ++offset;
+
+        line_end = offset;
+
+        /*
+         * Handle backslash-newline continuation.
+         */
+        logical_end = line_end;
+
+        while (logical_end > line_start &&
+               source[logical_end - 1] == '\\') {
+
+            if (offset < length)
+                ++offset;
+
+            while (offset < length &&
+                   source[offset] != '\n')
+                ++offset;
+
+            logical_end = offset;
         }
-        i++;
-    }
-    return len;
-}
 
-static int emit_newlines(pp_ctx *c, size_t count)
-{
-    while (count--) {
-        if (buf_append(c->out, "\n", 1)) return pp_oom(c);
+        cursor = line_start;
+
+        /*
+         * Skip whitespace before '#'.
+         */
+        while (cursor < logical_end &&
+               (source[cursor] == ' ' ||
+                source[cursor] == '\t'))
+            ++cursor;
+
+        if (cursor < logical_end &&
+            source[cursor] == '#') {
+
+            const char *directive_start;
+            const char *directive_end;
+            size_t directive_length;
+            const char *argument;
+            size_t argument_length;
+            char directive_name[64];
+
+            directive = 1;
+
+            ++cursor;
+
+            while (cursor < logical_end &&
+                   is_space_char(source[cursor]))
+                ++cursor;
+
+            directive_start = source + cursor;
+
+            while (cursor < logical_end &&
+                   is_identifier_char(source[cursor]))
+                ++cursor;
+
+            directive_end =
+                source + cursor;
+
+            directive_length =
+                (size_t)(
+                    directive_end -
+                    directive_start);
+
+            if (directive_length >=
+                sizeof(directive_name))
+                directive_length =
+                    sizeof(directive_name) - 1;
+
+            memcpy(
+                directive_name,
+                directive_start,
+                directive_length);
+
+            directive_name[
+                directive_length
+            ] = '\0';
+
+            while (cursor < logical_end &&
+                   is_space_char(source[cursor]))
+                ++cursor;
+
+            argument =
+                source + cursor;
+
+            argument_length =
+                logical_end - cursor;
+
+            if (strcmp(
+                    directive_name,
+                    "define") == 0) {
+
+                char name[256];
+                const char *value;
+                size_t value_length;
+
+                if (!conditional_active(
+                        context->conditionals))
+                    goto directive_done;
+
+                if (parse_identifier(
+                        &argument,
+                        source + logical_end,
+                        name,
+                        sizeof(name)) != 0) {
+
+                    pp_error(
+                        context,
+                        LO_PP_ERROR_INVALID_DEFINE,
+                        "invalid macro definition",
+                        line,
+                        1);
+
+                    goto fail;
+                }
+
+                /*
+                 * Function-like macros are intentionally
+                 * not supported yet.
+                 */
+                if (argument < source + logical_end &&
+                    *argument == '(') {
+
+                    pp_error(
+                        context,
+                        LO_PP_ERROR_INVALID_DEFINE,
+                        "function-like macros are not supported yet",
+                        line,
+                        1);
+
+                    goto fail;
+                }
+
+                while (argument <
+                           source + logical_end &&
+                       is_space_char(*argument))
+                    ++argument;
+
+                value = argument;
+
+                value_length =
+                    (size_t)(
+                        source + logical_end -
+                        value);
+
+                while (value_length > 0 &&
+                       is_space_char(
+                           value[value_length - 1]))
+                    --value_length;
+
+                {
+                    char *value_copy =
+                        pp_strndup(
+                            value,
+                            value_length);
+
+                    int result;
+
+                    if (!value_copy) {
+                        pp_oom(context, line);
+                        goto fail;
+                    }
+
+                    result =
+                        define_macro(
+                            context->pp,
+                            name,
+                            value_copy);
+
+                    free(value_copy);
+
+                    if (result != 0) {
+                        pp_oom(context, line);
+                        goto fail;
+                    }
+                }
+            }
+            else if (strcmp(
+                         directive_name,
+                         "undef") == 0) {
+
+                char name[256];
+
+                if (!conditional_active(
+                        context->conditionals))
+                    goto directive_done;
+
+                if (parse_identifier(
+                        &argument,
+                        source + logical_end,
+                        name,
+                        sizeof(name)) != 0) {
+
+                    pp_error(
+                        context,
+                        LO_PP_ERROR_INVALID_UNDEF,
+                        "invalid #undef",
+                        line,
+                        1);
+
+                    goto fail;
+                }
+
+                undef_macro(
+                    context->pp,
+                    name);
+            }
+            else if (strcmp(
+                         directive_name,
+                         "include") == 0) {
+
+                char name[4096];
+                size_t name_length = 0;
+                int angled;
+
+                if (!conditional_active(
+                        context->conditionals))
+                    goto directive_done;
+
+                while (argument <
+                           source + logical_end &&
+                       is_space_char(*argument))
+                    ++argument;
+
+                if (argument >=
+                    source + logical_end) {
+
+                    pp_error(
+                        context,
+                        LO_PP_ERROR_INCLUDE_ERROR,
+                        "missing include file",
+                        line,
+                        1);
+
+                    goto fail;
+                }
+
+                if (*argument == '<')
+                    angled = 1;
+                else if (*argument == '"')
+                    angled = 0;
+                else {
+                    pp_error(
+                        context,
+                        LO_PP_ERROR_INCLUDE_ERROR,
+                        "invalid include syntax",
+                        line,
+                        1);
+
+                    goto fail;
+                }
+
+                {
+                    char closing =
+                        angled ? '>' : '"';
+
+                    ++argument;
+
+                    while (
+                        argument <
+                            source + logical_end &&
+                        *argument != closing) {
+
+                        if (name_length + 1 <
+                            sizeof(name))
+                            name[name_length++] =
+                                *argument;
+
+                        ++argument;
+                    }
+
+                    if (argument >=
+                        source + logical_end) {
+
+                        pp_error(
+                            context,
+                            LO_PP_ERROR_INCLUDE_ERROR,
+                            "unterminated include",
+                            line,
+                            1);
+
+                        goto fail;
+                    }
+                }
+
+                name[name_length] = '\0';
+
+                if (process_include(
+                        context,
+                        name,
+                        angled,
+                        line) != 0)
+                    goto fail;
+            }
+            else if (strcmp(
+                         directive_name,
+                         "ifdef") == 0) {
+
+                char name[256];
+                int condition = 0;
+
+                if (parse_identifier(
+                        &argument,
+                        source + logical_end,
+                        name,
+                        sizeof(name)) == 0) {
+
+                    condition =
+                        find_macro(
+                            context->pp,
+                            name) != NULL;
+                }
+
+                if (conditional_push(
+                        context,
+                        condition) != 0) {
+
+                    pp_oom(context, line);
+                    goto fail;
+                }
+            }
+            else if (strcmp(
+                         directive_name,
+                         "ifndef") == 0) {
+
+                char name[256];
+                int condition = 0;
+
+                if (parse_identifier(
+                        &argument,
+                        source + logical_end,
+                        name,
+                        sizeof(name)) == 0) {
+
+                    condition =
+                        find_macro(
+                            context->pp,
+                            name) == NULL;
+                }
+
+                if (conditional_push(
+                        context,
+                        condition) != 0) {
+
+                    pp_oom(context, line);
+                    goto fail;
+                }
+            }
+            else if (strcmp(
+                         directive_name,
+                         "if") == 0) {
+
+                int condition = 0;
+
+                if (conditional_active(
+                        context->conditionals)) {
+
+                    condition =
+                        evaluate_condition(
+                            context->pp,
+                            argument,
+                            argument_length);
+                }
+
+                if (conditional_push(
+                        context,
+                        condition) != 0) {
+
+                    pp_oom(context, line);
+                    goto fail;
+                }
+            }
+            else if (strcmp(
+                         directive_name,
+                         "else") == 0) {
+
+                if (conditional_else(
+                        context) != 0) {
+
+                    pp_error(
+                        context,
+                        LO_PP_ERROR_INVALID_CONDITIONAL,
+                        "unexpected #else",
+                        line,
+                        1);
+
+                    goto fail;
+                }
+            }
+            else if (strcmp(
+                         directive_name,
+                         "endif") == 0) {
+
+                if (conditional_pop(
+                        context) != 0) {
+
+                    pp_error(
+                        context,
+                        LO_PP_ERROR_INVALID_CONDITIONAL,
+                        "unexpected #endif",
+                        line,
+                        1);
+
+                    goto fail;
+                }
+            }
+            else if (directive_name[0] != '\0') {
+
+                if (conditional_active(
+                        context->conditionals)) {
+
+                    pp_error(
+                        context,
+                        LO_PP_ERROR_INVALID_DIRECTIVE,
+                        "unknown preprocessing directive",
+                        line,
+                        1);
+
+                    goto fail;
+                }
+            }
+
+directive_done:
+
+            /*
+             * Preserve newlines so lexer diagnostics
+             * continue to use the original line numbers.
+             */
+            {
+                size_t i;
+
+                for (i = 0;
+                     i < logical_end - line_start;
+                     ++i) {
+
+                    if (buffer_putc(
+                            context->output,
+                            '\n') != 0) {
+
+                        pp_oom(context, line);
+                        goto fail;
+                    }
+                }
+            }
+        }
+        else if (conditional_active(
+                     context->conditionals)) {
+
+            if (expand_text(
+                    context,
+                    source + line_start,
+                    logical_end - line_start,
+                    NULL,
+                    0) != 0)
+                goto fail;
+
+            if (logical_end < length) {
+                if (buffer_putc(
+                        context->output,
+                        '\n') != 0) {
+
+                    pp_oom(context, line);
+                    goto fail;
+                }
+            }
+        }
+        else {
+            /*
+             * Keep newlines from disabled code.
+             */
+            if (logical_end < length) {
+                if (buffer_putc(
+                        context->output,
+                        '\n') != 0) {
+
+                    pp_oom(context, line);
+                    goto fail;
+                }
+            }
+        }
+
+        if (logical_end < length)
+            offset = logical_end + 1;
+        else
+            offset = logical_end;
+
+        ++line;
+
+        (void)directive;
     }
+
+    if (context->conditionals !=
+        saved_conditionals) {
+
+        pp_error(
+            context,
+            LO_PP_ERROR_INVALID_CONDITIONAL,
+            "unterminated conditional",
+            line,
+            1);
+
+        goto fail;
+    }
+
     return 0;
-}
 
-static int process(pp_ctx *c, const char *src, size_t len, const char *dir)
-{
-    lo_preprocessor *pp = c->pp;
-    size_t base = pp->conditional_count;
-    size_t saved_line = pp->line;
-    size_t pos = 0;
-    int in_block = 0;
-    int rc = 0;
-    size_t hide[PP_MAX_EXPAND_DEPTH];
+fail:
+    while (context->conditionals !=
+           saved_conditionals) {
 
-    pp->line = 1;
-
-    while (pos < len) {
-        size_t lines, end, line_len, hash, nls;
-        int is_dir = 0;
-
-        end = logical_line_end(src, len, pos, &lines);
-        line_len = end - pos;
-        nls = (lines - 1) + (end < len ? 1 : 0);
-
-        hash = pos;
-        if (!in_block) {
-            while (hash < end && (src[hash] == ' ' || src[hash] == '\t'
-                                  || src[hash] == '\v' || src[hash] == '\f')) {
-                hash++;
-            }
-            is_dir = hash < end && src[hash] == '#';
-        }
-
-        if (is_dir) {
-            size_t col = hash - pos + 1;
-            const char *text = src + hash + 1;
-            size_t tn = end - (hash + 1);
-            char *tmp = malloc(tn + 1);
-            size_t tl;
-            lo_pp_directive_kind peek;
-
-            if (!tmp) { rc = pp_oom(c); goto done; }
-            tl = clean_text(text, tn, tmp, &in_block);
-            tmp[tl] = '\0';
-
-            {   /* conditional-stack underflow is relative to this file */
-                size_t k = 0, s0;
-                skip_ws(tmp, tl, &k);
-                s0 = k;
-                while (k < tl && is_id_char(tmp[k])) k++;
-                peek = classify(tmp + s0, k - s0);
-            }
-            if (peek == LO_PP_DIRECTIVE_ELSE && pp->conditional_count <= base) {
-                rc = pp_fail(c, LO_PP_ERROR_UNEXPECTED_ELSE,
-                             "#else without matching #if", pp->line, col);
-            } else if (peek == LO_PP_DIRECTIVE_ENDIF
-                       && pp->conditional_count <= base) {
-                rc = pp_fail(c, LO_PP_ERROR_UNEXPECTED_ENDIF,
-                             "#endif without matching #if", pp->line, col);
-            } else {
-                rc = run_directive(c, tmp, tl, pp->line, col, dir);
-            }
-            free(tmp);
-            if (rc) goto done;
-            if (in_block && is_active(pp)) {
-                if (buf_append(c->out, "/*", 2)) { rc = pp_oom(c); goto done; }
-            }
-            if (emit_newlines(c, nls)) { rc = -1; goto done; }
-        } else if (!is_active(pp)) {
-            (void)clean_text(src + pos, line_len, NULL, &in_block);
-            if (emit_newlines(c, nls)) { rc = -1; goto done; }
-        } else {
-            if (expand_text(c, src + pos, line_len, &in_block, hide, 0)) {
-                rc = -1;
-                goto done;
-            }
-            if (end < len && buf_append(c->out, "\n", 1)) {
-                rc = pp_oom(c);
-                goto done;
-            }
-        }
-
-        pp->line += lines;
-        pos = end < len ? end + 1 : len;
+        conditional_pop(context);
     }
 
-    if (pp->conditional_count > base) {
-        rc = pp_fail(c, LO_PP_ERROR_UNTERMINATED_CONDITIONAL,
-                     "unterminated conditional directive", pp->line, 1);
-    }
-
-done:
-    if (rc == 0) pp->line = saved_line;
-    return rc;
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
 /* public API                                                          */
 /* ------------------------------------------------------------------ */
 
-void lo_preprocessor_init(lo_preprocessor *preprocessor, const char *source,
-                          size_t length)
+void lo_preprocessor_init(
+    lo_preprocessor *preprocessor,
+    const char *source,
+    size_t length)
 {
-    if (!preprocessor) return;
-    memset(preprocessor, 0, sizeof *preprocessor);
+    if (!preprocessor)
+        return;
+
+    memset(
+        preprocessor,
+        0,
+        sizeof(*preprocessor));
+
     preprocessor->source = source;
     preprocessor->length = length;
-    preprocessor->line = 1;
-    preprocessor->column = 1;
 }
 
-int lo_preprocessor_run(lo_preprocessor *preprocessor, char **output,
-                        size_t *output_length, lo_pp_error *error)
+int lo_pp_add_include_dir(
+    lo_preprocessor *preprocessor,
+    const char *path
+)
 {
-    pp_buf out = { NULL, 0, 0 };
-    pp_ctx ctx;
-    int rc;
+    if (!preprocessor || !path || path[0] == '\0')
+        return 0;
 
-    if (output) *output = NULL;
-    if (output_length) *output_length = 0;
+    lo_pp_include_dir *entry =
+        calloc(1, sizeof(*entry));
+
+    if (!entry)
+        return 0;
+
+    entry->path = malloc(strlen(path) + 1);
+
+    if (!entry->path) {
+        free(entry);
+        return 0;
+    }
+
+    strcpy(entry->path, path);
+
+    entry->next = NULL;
+
+    if (!preprocessor->include_dirs) {
+        preprocessor->include_dirs = entry;
+        return 1;
+    }
+
+    lo_pp_include_dir *tail =
+        preprocessor->include_dirs;
+
+    while (tail->next)
+        tail = tail->next;
+
+    tail->next = entry;
+
+    return 1;
+}
+
+int lo_pp_set_source_file(
+    lo_preprocessor *preprocessor,
+    const char *path
+)
+{
+    if (!preprocessor || !path)
+        return 0;
+
+    char *copy = malloc(strlen(path) + 1);
+
+    if (!copy)
+        return 0;
+
+    strcpy(copy, path);
+
+    free(preprocessor->source_file);
+    preprocessor->source_file = copy;
+
+    return 1;
+}
+
+int lo_preprocessor_run(
+    lo_preprocessor *preprocessor,
+    char **output,
+    size_t *output_length,
+    lo_pp_error *error)
+{
+    pp_buffer buffer = {0};
+    pp_context context;
+    int result;
+
+    if (output)
+        *output = NULL;
+
+    if (output_length)
+        *output_length = 0;
+
     if (error) {
-        error->kind = LO_PP_ERROR_NONE;
-        error->message = NULL;
+        error->kind =
+            LO_PP_ERROR_NONE;
+
+        error->message =
+            NULL;
+
         error->line = 0;
         error->column = 0;
     }
-    if (!preprocessor || !output || !output_length) {
+
+    if (!preprocessor ||
+        !output ||
+        !output_length) {
+
         if (error) {
-            error->kind = LO_PP_ERROR_INVALID_DIRECTIVE;
-            error->message = "invalid arguments";
+            error->kind =
+                LO_PP_ERROR_INVALID_DIRECTIVE;
+
+            error->message =
+                "invalid arguments";
         }
+
         return -1;
     }
 
-    preprocessor->offset = 0;
-    preprocessor->line = 1;
-    preprocessor->column = 1;
-    preprocessor->conditional_count = 0;
+    memset(
+        &context,
+        0,
+        sizeof(context));
 
-    ctx.pp = preprocessor;
-    ctx.out = &out;
-    ctx.err = error;
-    ctx.depth = 0;
+    context.pp =
+        preprocessor;
 
-    if (buf_reserve(&out, preprocessor->length) != 0) {
-        return pp_oom(&ctx);
-    }
-    out.data[0] = '\0';
+    context.output =
+        &buffer;
 
-    rc = process(&ctx, preprocessor->source ? preprocessor->source : "",
-                 preprocessor->source ? preprocessor->length : 0, NULL);
-    if (rc != 0) {
-        free(out.data);
+    context.error =
+        error;
+
+    if (buffer_reserve(
+            &buffer,
+            preprocessor->length) != 0) {
+
+        pp_oom(&context, 1);
         return -1;
     }
 
-    preprocessor->offset = preprocessor->length;
-    *output = out.data;
-    *output_length = out.length;
+    buffer.data[0] = '\0';
+
+    result =
+        process_source(
+            &context,
+            preprocessor->source
+                ? preprocessor->source
+                : "",
+            preprocessor->source
+                ? preprocessor->length
+                : 0,
+            preprocessor->source_file,
+            0);
+
+    conditional_free_all(&context);
+
+    if (result != 0) {
+        free(buffer.data);
+        return -1;
+    }
+
+    *output =
+        buffer.data;
+
+    *output_length =
+        buffer.length;
+
     return 0;
 }
 
-void lo_preprocessor_free(lo_preprocessor *preprocessor)
+void lo_preprocessor_free(
+    lo_preprocessor *preprocessor)
 {
-    size_t i;
+    lo_pp_macro *macro;
+    lo_pp_include_dir *directory;
 
-    if (!preprocessor) return;
-    for (i = 0; i < preprocessor->macro_count; i++) {
-        free((void *)preprocessor->macros[i].name);
+    if (!preprocessor)
+        return;
+
+    while (preprocessor->macros) {
+        macro =
+            preprocessor->macros;
+
+        preprocessor->macros =
+            macro->next;
+
+        free(macro->name);
+        free(macro->value);
+        free(macro);
     }
-    free(preprocessor->macros);
-    free(preprocessor->conditionals);
-    preprocessor->macros = NULL;
-    preprocessor->macro_count = 0;
-    preprocessor->macro_capacity = 0;
-    preprocessor->conditionals = NULL;
-    preprocessor->conditional_count = 0;
-    preprocessor->conditional_capacity = 0;
+
+    while (preprocessor->include_dirs) {
+        directory =
+            preprocessor->include_dirs;
+
+        preprocessor->include_dirs =
+            directory->next;
+
+        free(directory->path);
+        free(directory);
+    }
+
+    free(preprocessor->source_file);
+
+    preprocessor->source_file = NULL;
+    preprocessor->source = NULL;
+    preprocessor->length = 0;
 }

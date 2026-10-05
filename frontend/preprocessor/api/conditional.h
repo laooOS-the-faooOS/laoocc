@@ -1,7 +1,5 @@
-#ifndef LAOOCC_PREPROCESSOR_CONDITIONAL_H
-#define LAOOCC_PREPROCESSOR_CONDITIONAL_H
-
-#include <stddef.h>
+#ifndef LAOOCC_PP_CONDITIONAL_H
+#define LAOOCC_PP_CONDITIONAL_H
 
 typedef struct lo_pp_conditional {
     int parent_active;
